@@ -62,8 +62,6 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
-STATE_FILE = os.environ.get("STATE_FILE", "state.json")
-
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
 )
@@ -119,7 +117,8 @@ CREDS = get_credentials()
 GC = gspread.authorize(CREDS)
 DRIVE_CREDS = get_drive_credentials()
 DRIVE = build("drive", "v3", credentials=DRIVE_CREDS)
-SHEET = GC.open_by_key(SPREADSHEET_ID).sheet1
+SPREADSHEET = GC.open_by_key(SPREADSHEET_ID)
+SHEET = SPREADSHEET.sheet1
 
 
 def ensure_headers() -> None:
@@ -129,19 +128,36 @@ def ensure_headers() -> None:
 
 
 # ------------------------------------------------------------------
-# Estado simples: qual é a "obra ativa" de cada conversa do Telegram
+# Estado simples: qual é a "obra ativa" de cada conversa do Telegram.
+#
+# Fica guardado numa aba própria da mesma planilha (não num arquivo no
+# servidor), porque o Railway apaga o disco a cada novo deploy - se
+# guardássemos num arquivo local, toda atualização do bot faria ele
+# "esquecer" a obra ativa de cada conversa.
 # ------------------------------------------------------------------
 
+ESTADO_ABA = "estado_bot"
+
+
+def get_estado_sheet():
+    try:
+        return SPREADSHEET.worksheet(ESTADO_ABA)
+    except gspread.exceptions.WorksheetNotFound:
+        aba = SPREADSHEET.add_worksheet(title=ESTADO_ABA, rows=200, cols=2)
+        aba.update("A1", [["chat_id", "obra_ativa"]])
+        return aba
+
+
+ESTADO_SHEET = get_estado_sheet()
+
+
 def load_state() -> dict:
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE) as f:
-            return json.load(f)
-    return {}
-
-
-def save_state(state: dict) -> None:
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f)
+    try:
+        linhas = ESTADO_SHEET.get_all_values()[1:]  # pula o cabeçalho
+        return {linha[0]: linha[1] for linha in linhas if len(linha) >= 2 and linha[0]}
+    except Exception:
+        logger.exception("Falha ao carregar estado da planilha, começando vazio.")
+        return {}
 
 
 STATE = load_state()
@@ -152,8 +168,13 @@ def get_obra_ativa(chat_id: int):
 
 
 def set_obra_ativa(chat_id: int, obra: str) -> None:
-    STATE[str(chat_id)] = obra
-    save_state(STATE)
+    chat_id_str = str(chat_id)
+    STATE[chat_id_str] = obra
+    cell = ESTADO_SHEET.find(chat_id_str, in_column=1)
+    if cell:
+        ESTADO_SHEET.update_cell(cell.row, 2, obra)
+    else:
+        ESTADO_SHEET.append_row([chat_id_str, obra], value_input_option="USER_ENTERED")
 
 
 # ------------------------------------------------------------------
