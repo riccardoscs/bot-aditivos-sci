@@ -188,6 +188,11 @@ ORCAMENTOS_PENDENTES: dict = {}  # chat_id -> {"itens": [...], "total_material":
 
 PERCENTUAIS_SUGERIDOS = [15, 20, 25, 30, 35, 40, 45, 50]
 
+# chat_id -> lista de nomes de obra mostrada na última vez que /obra
+# (sem argumento) listou as pastas existentes - usado pra traduzir o
+# índice do botão clicado de volta pro nome da obra.
+OBRAS_LISTADAS: dict = {}
+
 
 def parse_numero(texto: str) -> float:
     """Converte '200m', 'R$ 2,50', '1.250,00', '4.500' etc. num float."""
@@ -239,6 +244,20 @@ def get_obra_folder(obra: str) -> str:
     return get_or_create_folder(obra, DRIVE_ROOT_FOLDER_ID)
 
 
+def listar_obras() -> list:
+    """Lista as pastas de obra que já existem dentro da pasta raiz."""
+    query = (
+        "mimeType = 'application/vnd.google-apps.folder' "
+        f"and '{DRIVE_ROOT_FOLDER_ID}' in parents and trashed = false"
+    )
+    res = (
+        DRIVE.files()
+        .list(q=query, fields="files(id, name)", orderBy="name", pageSize=50)
+        .execute()
+    )
+    return res.get("files", [])
+
+
 def upload_bytes(file_bytes: bytes, filename: str, mimetype: str, folder_id: str) -> str:
     media = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype=mimetype, resumable=False)
     metadata = {"name": filename, "parents": [folder_id]}
@@ -275,7 +294,9 @@ def autorizado(update: Update) -> bool:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Oi! Eu sou o bot de aditivos da Santa Cruz Instalações.\n\n"
-        "1) Use /obra <nome da obra> para definir a obra ativa deste chat.\n"
+        "1) Use /obra <nome da obra> para definir a obra ativa deste chat, "
+        "ou só /obra (sem nome) pra ver as obras que já existem e escolher "
+        "uma com um clique.\n"
         "2) Depois é só mandar texto, foto, áudio ou documento (PDF, Excel "
         "etc.) - eu registro tudo organizado na planilha e no Drive, na "
         "pasta da obra.\n"
@@ -296,15 +317,65 @@ async def cmd_obra(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not autorizado(update):
         return
     if not context.args:
-        atual = get_obra_ativa(update.effective_chat.id)
-        msg = f"Obra ativa: {atual}" if atual else "Nenhuma obra ativa. Use /obra <nome>."
-        await update.message.reply_text(msg)
+        chat_id = update.effective_chat.id
+        atual = get_obra_ativa(chat_id)
+        obras = listar_obras()
+        cabecalho = f"Obra ativa: {atual}\n\n" if atual else ""
+
+        if not obras:
+            await update.message.reply_text(
+                cabecalho + "Nenhuma obra cadastrada ainda. Use /obra <nome> "
+                "pra criar a primeira."
+            )
+            return
+
+        nomes = [o["name"] for o in obras]
+        OBRAS_LISTADAS[chat_id] = nomes
+        botoes = [
+            InlineKeyboardButton(nome, callback_data=f"obrasel:{i}")
+            for i, nome in enumerate(nomes)
+        ]
+        teclado = InlineKeyboardMarkup([botoes[i : i + 2] for i in range(0, len(botoes), 2)])
+        await update.message.reply_text(
+            cabecalho + "Escolhe uma obra existente abaixo, ou manda "
+            "/obra <nome novo> pra criar outra:",
+            reply_markup=teclado,
+        )
         return
+
     nome = " ".join(context.args)
     set_obra_ativa(update.effective_chat.id, nome)
     get_obra_folder(nome)  # já garante que a pasta existe no Drive
     await update.message.reply_text(
-        f"Obra ativa definida: {nome}\nAgora é só mandar texto, foto ou áudio."
+        f"Obra ativa definida: {nome}\nAgora é só mandar texto, foto, áudio ou documento."
+    )
+
+
+async def cb_obra_selecionar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if not autorizado(update):
+        return
+
+    chat_id = query.message.chat.id
+    nomes = OBRAS_LISTADAS.get(chat_id)
+    if not nomes:
+        await query.edit_message_text(
+            "Essa lista expirou. Manda /obra de novo pra ver as obras existentes."
+        )
+        return
+
+    try:
+        indice = int(query.data.split(":")[1])
+        nome = nomes[indice]
+    except (IndexError, ValueError):
+        await query.edit_message_text("Não consegui identificar a obra escolhida, tenta de novo.")
+        return
+
+    set_obra_ativa(chat_id, nome)
+    get_obra_folder(nome)
+    await query.edit_message_text(
+        f"Obra ativa definida: {nome}\nAgora é só mandar texto, foto, áudio ou documento."
     )
 
 
@@ -567,6 +638,7 @@ def main() -> None:
     app.add_handler(CommandHandler(["fechar_orcamento", "fechar"], cmd_fechar_orcamento))
     app.add_handler(CommandHandler(["cancelar_orcamento", "cancelar"], cmd_cancelar_orcamento))
     app.add_handler(CallbackQueryHandler(cb_percentual, pattern=r"^orcpct:"))
+    app.add_handler(CallbackQueryHandler(cb_obra_selecionar, pattern=r"^obrasel:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, texto))
     app.add_handler(MessageHandler(filters.PHOTO, foto))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, audio))
