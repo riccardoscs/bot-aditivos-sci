@@ -16,14 +16,16 @@ import os
 import io
 import json
 import logging
+import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
@@ -155,6 +157,41 @@ def set_obra_ativa(chat_id: int, obra: str) -> None:
 
 
 # ------------------------------------------------------------------
+# Orçamento de material: rascunho de itens em andamento por chat, e
+# percentuais sugeridos (o percentual que o material representa do
+# valor total do aditivo).
+# ------------------------------------------------------------------
+
+ORCAMENTOS_ABERTOS: dict = {}  # chat_id -> lista de itens
+ORCAMENTOS_PENDENTES: dict = {}  # chat_id -> {"itens": [...], "total_material": float}
+
+PERCENTUAIS_SUGERIDOS = [15, 20, 25, 30, 35, 40, 45, 50]
+
+
+def parse_numero(texto: str) -> float:
+    """Converte '200m', 'R$ 2,50', '1.250,00', '4.500' etc. num float."""
+    limpo = re.sub(r"(?i)r\$", "", texto).strip()
+    limpo = re.sub(r"[^0-9.,]", "", limpo)
+    if "," in limpo and "." in limpo:
+        limpo = limpo.replace(".", "").replace(",", ".")
+    elif "," in limpo:
+        limpo = limpo.replace(",", ".")
+    elif "." in limpo:
+        # Só ponto, sem vírgula: ambíguo entre decimal (4.50) e
+        # separador de milhar ao estilo BR (4.500). Se o último
+        # grupo depois do ponto tiver 3 dígitos, tratamos como
+        # milhar; se tiver 1-2, como parte decimal.
+        ultimo_grupo = limpo.rsplit(".", 1)[-1]
+        if len(ultimo_grupo) == 3:
+            limpo = limpo.replace(".", "")
+    return float(limpo)
+
+
+def formatar_moeda(valor: float) -> str:
+    return f"R$ {valor:,.2f}"
+
+
+# ------------------------------------------------------------------
 # Google Drive: uma pasta por obra, dentro da pasta raiz configurada
 # ------------------------------------------------------------------
 
@@ -218,10 +255,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Oi! Eu sou o bot de aditivos da Santa Cruz Instalações.\n\n"
         "1) Use /obra <nome da obra> para definir a obra ativa deste chat.\n"
-        "2) Depois é só mandar texto, foto ou áudio - eu registro tudo "
-        "organizado na planilha e no Drive, na pasta da obra.\n"
+        "2) Depois é só mandar texto, foto, áudio ou documento (PDF, Excel "
+        "etc.) - eu registro tudo organizado na planilha e no Drive, na "
+        "pasta da obra.\n"
         "3) Use /preco <m2> <% área molhada> para uma sugestão de valor "
-        "baseada na faixa que vocês já praticam.\n\n"
+        "baseada na faixa que vocês já praticam.\n"
+        "4) Use /orcamento para montar o valor do aditivo a partir dos "
+        "itens de material (eu calculo o total pedindo o % que o "
+        "material representa do aditivo).\n\n"
         "Use /ajuda a qualquer momento para ver esses comandos de novo."
     )
 
@@ -278,6 +319,113 @@ async def cmd_preco(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def cmd_orcamento(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not autorizado(update):
+        return
+    obra = get_obra_ativa(update.effective_chat.id)
+    if not obra:
+        await update.message.reply_text("Defina a obra ativa primeiro com /obra <nome>.")
+        return
+    chat_id = update.effective_chat.id
+    ORCAMENTOS_ABERTOS[chat_id] = []
+    await update.message.reply_text(
+        "Ok, vamos montar o orçamento de material da obra "
+        f"'{obra}'.\n\n"
+        "Manda os itens, um por mensagem, neste formato:\n"
+        "descrição - quantidade - valor unitário\n\n"
+        "Exemplo: Fio 2,5mm - 200m - 2,50\n\n"
+        "Quando terminar de mandar os itens, use /fechar_orcamento "
+        "(ou /cancelar_orcamento para desistir)."
+    )
+
+
+async def cmd_fechar_orcamento(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not autorizado(update):
+        return
+    chat_id = update.effective_chat.id
+    itens = ORCAMENTOS_ABERTOS.get(chat_id)
+    if not itens:
+        await update.message.reply_text(
+            "Não há itens de material registrados ainda. Use /orcamento "
+            "para começar."
+        )
+        return
+
+    total_material = sum(item["total"] for item in itens)
+    linhas = "\n".join(
+        f"- {item['desc']}: {item['qtd']:g} x {formatar_moeda(item['valor_unit'])} "
+        f"= {formatar_moeda(item['total'])}"
+        for item in itens
+    )
+    ORCAMENTOS_PENDENTES[chat_id] = {"itens": itens, "total_material": total_material}
+    del ORCAMENTOS_ABERTOS[chat_id]
+
+    botoes = [
+        InlineKeyboardButton(f"{p}%", callback_data=f"orcpct:{p}")
+        for p in PERCENTUAIS_SUGERIDOS
+    ]
+    teclado = InlineKeyboardMarkup([botoes[i : i + 4] for i in range(0, len(botoes), 4)])
+
+    await update.message.reply_text(
+        f"Itens do material:\n{linhas}\n\n"
+        f"Total de material: {formatar_moeda(total_material)}\n\n"
+        "Esse valor de material representa quantos % do valor total do "
+        "aditivo? Escolhe abaixo:",
+        reply_markup=teclado,
+    )
+
+
+async def cmd_cancelar_orcamento(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not autorizado(update):
+        return
+    chat_id = update.effective_chat.id
+    ORCAMENTOS_ABERTOS.pop(chat_id, None)
+    ORCAMENTOS_PENDENTES.pop(chat_id, None)
+    await update.message.reply_text("Orçamento cancelado.")
+
+
+async def cb_percentual(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if not autorizado(update):
+        return
+
+    chat_id = query.message.chat.id
+    pendente = ORCAMENTOS_PENDENTES.get(chat_id)
+    if not pendente:
+        await query.edit_message_text(
+            "Esse orçamento já foi encerrado ou expirou. Use /orcamento "
+            "para começar um novo."
+        )
+        return
+
+    pct = float(query.data.split(":")[1])
+    total_material = pendente["total_material"]
+    total_aditivo = total_material / (pct / 100.0)
+    resto = total_aditivo - total_material
+
+    resumo = (
+        f"Material: {formatar_moeda(total_material)} ({pct:g}%)\n"
+        f"Mão de obra / demais custos: {formatar_moeda(resto)} ({100 - pct:g}%)\n"
+        f"Total estimado do aditivo: {formatar_moeda(total_aditivo)}"
+    )
+    await query.edit_message_text(f"Orçamento fechado ✅\n\n{resumo}")
+
+    obra = get_obra_ativa(chat_id) or "Sem obra definida"
+    linhas = "\n".join(
+        f"- {item['desc']}: {item['qtd']:g} x {formatar_moeda(item['valor_unit'])} "
+        f"= {formatar_moeda(item['total'])}"
+        for item in pendente["itens"]
+    )
+    registrar(
+        obra,
+        "Orçamento",
+        f"Itens:\n{linhas}\n\n{resumo}",
+        query.from_user.first_name,
+    )
+    del ORCAMENTOS_PENDENTES[chat_id]
+
+
 async def texto(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not autorizado(update):
         return
@@ -285,6 +433,44 @@ async def texto(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not obra:
         await update.message.reply_text("Defina a obra ativa primeiro com /obra <nome>.")
         return
+
+    chat_id = update.effective_chat.id
+    if ORCAMENTOS_ABERTOS.get(chat_id) is not None:
+        partes = update.message.text.rsplit(" - ", 2)
+        if len(partes) == 3:
+            desc, qtd_txt, valor_txt = partes
+            try:
+                qtd = parse_numero(qtd_txt)
+                valor_unit = parse_numero(valor_txt)
+            except ValueError:
+                partes = None
+        else:
+            partes = None
+
+        if not partes:
+            await update.message.reply_text(
+                "Não entendi esse item. Manda no formato:\n"
+                "descrição - quantidade - valor unitário\n"
+                "Exemplo: Fio 2,5mm - 200m - 2,50\n\n"
+                "Ou use /fechar_orcamento se já terminou, ou "
+                "/cancelar_orcamento para desistir."
+            )
+            return
+
+        item_total = qtd * valor_unit
+        ORCAMENTOS_ABERTOS[chat_id].append(
+            {"desc": desc.strip(), "qtd": qtd, "valor_unit": valor_unit, "total": item_total}
+        )
+        total_ate_agora = sum(i["total"] for i in ORCAMENTOS_ABERTOS[chat_id])
+        await update.message.reply_text(
+            f"Item adicionado: {desc.strip()} - {qtd:g} x "
+            f"{formatar_moeda(valor_unit)} = {formatar_moeda(item_total)}\n"
+            f"Total de material até agora: {formatar_moeda(total_ate_agora)}\n\n"
+            "Manda mais itens ou use /fechar_orcamento para calcular o "
+            "total do aditivo."
+        )
+        return
+
     registrar(obra, "Texto", update.message.text, update.effective_user.first_name)
     await update.message.reply_text("Registrado ✅")
 
@@ -327,6 +513,27 @@ async def audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("Áudio salvo na pasta da obra ✅")
 
 
+async def documento(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not autorizado(update):
+        return
+    obra = get_obra_ativa(update.effective_chat.id)
+    if not obra:
+        await update.message.reply_text("Defina a obra ativa primeiro com /obra <nome>.")
+        return
+
+    doc = update.message.document
+    tg_file = await doc.get_file()
+    file_bytes = await tg_file.download_as_bytearray()
+    filename = doc.file_name or f"documento_{datetime.now(TZ).strftime('%Y%m%d_%H%M%S')}"
+    mimetype = doc.mime_type or "application/octet-stream"
+    folder_id = get_obra_folder(obra)
+    link = upload_bytes(bytes(file_bytes), filename, mimetype, folder_id)
+
+    legenda = update.message.caption or filename
+    registrar(obra, "Documento", legenda, update.effective_user.first_name, link)
+    await update.message.reply_text("Documento salvo na pasta da obra ✅")
+
+
 def main() -> None:
     ensure_headers()
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
@@ -335,9 +542,14 @@ def main() -> None:
     app.add_handler(CommandHandler("ajuda", ajuda))
     app.add_handler(CommandHandler("obra", cmd_obra))
     app.add_handler(CommandHandler("preco", cmd_preco))
+    app.add_handler(CommandHandler("orcamento", cmd_orcamento))
+    app.add_handler(CommandHandler(["fechar_orcamento", "fechar"], cmd_fechar_orcamento))
+    app.add_handler(CommandHandler(["cancelar_orcamento", "cancelar"], cmd_cancelar_orcamento))
+    app.add_handler(CallbackQueryHandler(cb_percentual, pattern=r"^orcpct:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, texto))
     app.add_handler(MessageHandler(filters.PHOTO, foto))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, audio))
+    app.add_handler(MessageHandler(filters.Document.ALL, documento))
 
     logger.info("Bot iniciado, aguardando mensagens...")
     app.run_polling()
